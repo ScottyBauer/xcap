@@ -1,5 +1,14 @@
-obj-m := betaModule2.o
-CFLAGS_betaModule2.o = -DDEBUG -O2 -Wall
+obj-m := test.o
+#CFLAGS_test.o = -DDEBUG -DDEBUG_MWAIT_RETRY  -DTIMING -g -Wall
+#CFLAGS_betaModule2.o = -DDEBUG -DDEBUG_MWAIT_RETRY  -DTIMING -g -Wall
+#CFLAGS_ring-channel.o = -DDEBUG -DDEBUG_MWAIT_RETRY -DTIMING -g -Wall
+
+CFLAGS_test.o =  -O2 -DPOLL -DUSE_FLOOD #-DDEBUG_MWAIT_RETRY #-DDEBUG
+CFLAGS_betaModule2.o =  -O2 -DPOLL -DUSE_FLOOD #-DDEBUG_MWAIT_RETRY #-DDEBUG
+CFLAGS_ring-channel.o = -O2
+
+
+test-objs := ./ring-chan/ring-channel.o ./betaModule2.o
 
 KDIR := /lib/modules/`uname -r`/build
 

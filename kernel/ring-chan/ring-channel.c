@@ -11,23 +11,32 @@
 
 #include <asm-generic/getorder.h>
 #include <linux/mm.h>
+#include <linux/gfp.h>
 #include "ring-channel.h"
 
 
-static inline unsigned long lower_power_of_two(unsigned long)
+static inline unsigned long bsrl(unsigned long x)
 {
-	return 0x80000000000000 >> __builtin_clz(x);
+	unsigned long ret;
+	asm("bsr %1,%0" : "=r"(ret) : "r"(x));
+	return ret;
+
+}
+
+static inline unsigned long lower_power_of_two(unsigned long x)
+{
+	return 0x80000000000000UL >>  (__builtin_clzl(x)-1);
 }
 
 
 /* Stolen from  xen/mm.h */
 static inline int get_order_from_pages(unsigned long nr_pages)
 {
-    int order;
-    nr_pages--;
-    for ( order = 0; nr_pages; order++ )
-        nr_pages >>= 1;
-    return order;
+	int order;
+	nr_pages--;
+	for ( order = 0; nr_pages; order++ )
+		nr_pages >>= 1;
+	return order;
 }
 
 int ttd_ring_channel_alloc(struct ttd_ring_channel *ring_channel,
@@ -40,12 +49,14 @@ int ttd_ring_channel_alloc(struct ttd_ring_channel *ring_channel,
 void ttd_ring_channel_free(struct ttd_ring_channel *ring_channel) {
 
 	if (ring_channel->recs) {
-		free_pages((void*)ring_channel->recs, ring_channel->buf_order);
+		free_pages((unsigned long) ring_channel->recs,
+			   ring_channel->buf_order);
 		ring_channel->recs = NULL;
 	}
 
 	if (ring_channel->buf) {
-		free_pages((void*)ring_channel->buf, ring_channel->header_order);
+		free_pages((unsigned long) ring_channel->buf,
+			   ring_channel->header_order);
 		ring_channel->buf = NULL;
 	}
 }
@@ -57,9 +68,8 @@ int ttd_ring_channel_alloc_with_metadata(struct ttd_ring_channel *ring_channel,
                                          unsigned long priv_metadata_size)
 {
 	int           ret;
-	unsigned long order, header_order, i;
+	unsigned long order, header_order;
 	unsigned long size_of_header_in_pages;
-
 	pr_debug("Allocating ring channel\n");
 	ttd_ring_channel_init(ring_channel);
 
@@ -69,7 +79,7 @@ int ttd_ring_channel_alloc_with_metadata(struct ttd_ring_channel *ring_channel,
 					    sizeof(struct ttd_buf));
 
 
-	if ( (ring_channel->buf = __get_free_pages(GFP_KERNEL, header_order)) == NULL ) {
+	if ( (ring_channel->buf = (void *)  __get_free_pages(GFP_KERNEL, header_order)) == NULL ) {
 		pr_err("Xen deterministic time-travel buffers: memory allocation failed\n");
 		return -EINVAL;
 	}
@@ -80,8 +90,8 @@ int ttd_ring_channel_alloc_with_metadata(struct ttd_ring_channel *ring_channel,
 		 priv_metadata_size + sizeof(struct ttd_buf), size_of_header_in_pages);
 
 	order = get_order_from_pages(size_in_pages);
-	if ( (ring_channel->recs = __get_free_pages(GFP_KERNEL, order)) == NULL ) {
-		pr_er("Xen deterministic time-travel buffers: memory allocationcd failed, "
+	if ( (ring_channel->recs = (char *) __get_free_pages(GFP_KERNEL, order)) == NULL ) {
+		pr_err("Xen deterministic time-travel buffers: memory allocationcd failed, "
 		       "size in pages:%lu, order:%lu\n", size_in_pages, order);
 		ret = -EINVAL; goto cleanup;
 	}
@@ -93,12 +103,32 @@ int ttd_ring_channel_alloc_with_metadata(struct ttd_ring_channel *ring_channel,
 	ttd_ring_channel_reinit_stats(ring_channel->buf);
 
 	ring_channel->size_of_a_rec = size_of_a_rec;
-	ring_channel->size_in_recs  = (lower_power_of_two(size_in_pages * PAGE_SIZE))
-		/ ring_channel->size_of_a_rec;
+	pr_debug("Size of a rec is %lu\n", size_of_a_rec);
 
+
+	/* ring_channel->size_in_recs  = (lower_power_of_two(size_in_pages * PAGE_SIZE))
+		/ ring_channel->size_of_a_rec;
+	*/
+	ring_channel->size_in_recs = (size_in_pages * PAGE_SIZE) /
+		ring_channel->size_of_a_rec;
+
+
+	pr_debug("size in recs is %lu lower_power_of_two returned %lu and in hex %lxwith input %lu and hex %lx\n",
+		 ring_channel->size_in_recs,
+		 lower_power_of_two(size_in_pages * PAGE_SIZE),
+		 lower_power_of_two(size_in_pages * PAGE_SIZE),
+		 (size_in_pages * PAGE_SIZE), (size_in_pages * PAGE_SIZE));
+	if (ring_channel->size_in_recs == 0) {
+		pr_err(" Size_in_recs was incorrectly 0\n");
+		ret = -EINVAL; goto cleanup;
+	}
 
 	/* Init shared buffer structures */
-	ring_channel->buf->payload_buffer_mfn = ring_channel->recs; /*NOTE*/
+
+	ring_channel->buf->payload_buffer_mfn =
+		(unsigned long) ring_channel->recs; /*NOTE*/
+
+
 	ring_channel->buf->payload_buffer_size = size_in_pages * PAGE_SIZE;
 	ring_channel->buf->size_of_a_rec = ring_channel->size_of_a_rec;
 

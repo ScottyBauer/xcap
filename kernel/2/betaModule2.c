@@ -7,234 +7,297 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/irqflags.h>
-
-//#include <linux/timekeeping.h>
 #include <linux/kthread.h>
+#include <linux/cpumask.h>
+#include <linux/preempt.h>
 #include <asm/uaccess.h>
 #include <asm/mwait.h>
 #include <asm/page_types.h>
+#include <asm/cpufeature.h>
+#include <linux/ktime.h>
+#include <asm/tsc.h>
+
+#include "ring-chan/ring-channel.h"
 #include "../betaModule.h"
 
 MODULE_LICENSE("GPL");
 
-
-/** 
- *   Useful things to look at:
- *   wait_event_interruptible /wait.h
- *   alloc_page / gfp.h
- * http://lxr.free-electrons.com/source/arch/x86/include/asm/mwait.h#L26
- *   
-*/
-
-static char* msg = "The quick brown fox jumped over the lazy dog."\
-	"Sally sells sea shells down by the sea shore. abcdefghijkl"\
-	"mnopqrstuvwxyz12345";
-
-static const int CPU_NUM = 3;
+static int CPU_NUM;
 
 
+/* 124 byte message */
+#if 0
+static char *msg = "12345678123456781234567812345678123456781234567812345678" \
+	"1234567";
+#endif
+
+static unsigned long start;
+static unsigned long end;
+volatile unsigned int should_stop;
+
+#if 0
 /* Stolen and slightly modified from http://rosettacode.org/wiki/Rot-13 */
 static char *rot13(char *s, int amount)
 {
-        char *p=s;
-        int upper;
+	char *p = s;
+	int upper;
 	int count = 0;
-        while(*p && count < amount) {
-                upper = *p;
-                if((upper>='a' && upper<='m') ||  (upper>='A' && upper<='M')) *p+=13;
-                else if((upper>='n' && upper<='z') || (upper>='A' && upper<='Z')) *p-=13;
-                ++p;
+
+	while (*p && count < amount) {
+		upper = *p;
+		if ((upper >= 'a' && upper <= 'm') ||
+		    (upper >= 'A' && upper <= 'M'))
+			*p += 13;
+		else if ((upper >= 'n' && upper <= 'z') ||
+			 (upper >= 'A' && upper <= 'Z'))
+			*p -= 13;
+		++p;
 		count++;
-        }
-        return s;
+	}
+	return s;
 }
+#endif
 
-
+#if defined(DEBUG_ASSERT_EXPECT)
 static void assert_expect_and_zero(struct ipc_message *i_msg, int need_rot)
 {
-	if(need_rot){
-		rot13(i_msg->message,123);
-	}
-	if(strncmp(i_msg->message,msg,124) != 0){
-		pr_debug("STRINGS DIFFERED IN CPU %d\n", CPU_NUM);
-	}
+	if (need_rot)
+		rot13(i_msg->message, BUF_SIZE);
+
+	if (strncmp(i_msg->message, msg, BUF_SIZE) != 0)
+		pr_err("STRINGS DIFFERED IN CPU %d\n", CPU_NUM);
+
 	i_msg->monitor = 0;
 }
+#endif
 
-static inline int keep_waiting(struct ipc_message *i_msg, unsigned int notify_key)
+#if defined(USE_MWAIT)
+static unsigned int find_target_mwait(void)
 {
-	return !(i_msg->monitor == notify_key);
+        unsigned int eax, ebx, ecx, edx;
+        unsigned int highest_cstate = 0;
+        unsigned int highest_subcstate = 0;
+        int i;
+
+        if (boot_cpu_data.cpuid_level < CPUID_MWAIT_LEAF)
+                return 0;
+
+        cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &edx);
+
+        if (!(ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED) ||
+            !(ecx & CPUID5_ECX_INTERRUPT_BREAK))
+                return 0;
+
+        edx >>= MWAIT_SUBSTATE_SIZE;
+        for (i = 0; i < 7 && edx; i++, edx >>= MWAIT_SUBSTATE_SIZE) {
+                if (edx & MWAIT_SUBSTATE_MASK) {
+                        highest_cstate = i;
+                        highest_subcstate = edx & MWAIT_SUBSTATE_MASK;
+                        printk(KERN_DEBUG "Found cstate at %d and highest_subcstate %d\n",
+                               i, highest_subcstate);
+                        printk(KERN_DEBUG "IF WE WERE TO RETURN NOW IT WOUDL LOOK LIKE %x\n", (highest_cstate << MWAIT_SUBSTATE_SIZE) | (highest_subcstate -1));
+                }
+        }
+        return (highest_cstate << MWAIT_SUBSTATE_SIZE) |
+                (highest_subcstate - 1);
+
 }
 
 
-static void send_and_notify(struct ipc_message *i_msg, char* _msg, size_t len,
-			    unsigned int notify_key)
-{
-		memcpy(i_msg->message,_msg,len);
-		/*pr_debug("BETA %d WRITING TO VOLTAILE VAR AT %p\n", CPU_NUM, 
-		  &i_msg->monitor);*/
-		i_msg->monitor = notify_key;
-
-} 
-
-
-static inline void* get_current_slot(size_t offset, void* buf)
-{
-	return (void*) ((char*)buf + offset);
-}
-
-/* All the casts are in here to stick within the standard. 
- * 6.2.5-19: The void type comprises an empty set of values; 
- * it is an incomplete type that cannot be completed.
- */
-static inline void* get_next_slot(size_t *offset, void* buf)
-{
-	*offset += sizeof(struct ipc_message);
-	*offset %= (PAGE_SIZE * 2);
-	return (void*) ((char*)buf) + *offset;
-}
-
-
-	
-
- static void ___monitor(const void *eax, unsigned long ecx,
-                               unsigned long edx)
- {
-         /* "monitor %eax, %ecx, %edx;" */
-	 // asm volatile("mov $0, %rbx;");
-	 asm volatile(".byte 0x0f, 0x01, 0xc8;"
-		      :: "a" (eax), "c" (ecx), "d"(edx));
- }
-
-static void ___mwait(unsigned long eax, unsigned long ecx)
-{
-	/* "mwait %eax, %ecx;" */
-	//       	asm volatile("mov $1, %rbx;");
-	asm volatile(".byte 0x0f, 0x01, 0xc9;"
-		     :: "a" (eax), "c" (ecx));
-}
-
-
-static inline void monitor_mwait(unsigned long rcx, volatile void *rax,
+static inline void monitor_mwait(unsigned long rcx, volatile uint32_t *rax,
 				 unsigned long wait_type)
 {
 
-	unsigned long flags;
-	/* TODO Figure out wtf the "extensions" and "hints" do for monitor */
-	if (this_cpu_has(X86_BUG_CLFLUSH_MONITOR)){
-		pr_debug("CFLUSHING ON CPU %d\n", CPU_NUM);
-		clflush(rax);
+	//unsigned long flags;
+	//int cpu;
+
+
+
+	/* smp is supposed to be used under "lock", however one can use it if
+	 * you have pegged your thread to a CPU, which we have.
+	 */
+	/* we know we're noot ona buggy cpu when we release we'll re-enable this */
+	/*cpu = smp_processor_id();
+
+	  if (cpu_has_bug(&cpu_data(cpu), X86_BUG_CLFLUSH_MONITOR)) {
+	  mb();
+	  clflush(rax);
+	  mb();
+	  }*/
+
+	//	local_irq_save(flags);
+	__monitor((void *)rax, 0, 0);
+	/* TODO comment for memory barrier, why is this necessary? */
+	mb();
+	__mwait(wait_type, rcx);
+	//	local_irq_restore(flags);
+}
+#endif
+
+
+static inline int check_cons_slot_available(struct ipc_message *loc, unsigned int token)
+{
+	return (likely(loc->monitor != token));
+}
+
+static inline int check_prod_slot_available(struct ipc_message *loc, unsigned int token)
+{
+	return (unlikely(loc->monitor != token));// && (loc->monitor != 0);
+}
+
+
+static struct ipc_message * get_next_available_slot(struct ttd_ring_channel *chan,
+					     unsigned long bucket)
+{
+	return (struct ipc_message *) ttd_ring_channel_get_rec_slow(chan,bucket);
+}
+
+
+static int wait_for_producer_slot(struct ipc_message *imsg, unsigned int token)
+{
+
+
+	while (check_prod_slot_available(imsg, token)) {
+
+#if defined(USE_MWAIT)
+		monitor_mwait(ecx, &imsg->monitor, cstate_wait);
+#endif//usemwait
+#if defined(POLL)
+			cpu_relax();
+			//asm volatile("pause" ::: "memory");
+#endif
 	}
-	
-	local_irq_save(flags);
-	___monitor((void*)rax,0, 0);
-	smp_mb();
-	___mwait(wait_type,rcx);
-	local_irq_restore(flags);
-}       	
+	return 0;
+}
+
+static  int wait_for_consumer_slot(struct ipc_message *imsg, unsigned int token)
+{
+
+
+	while (likely(check_cons_slot_available(imsg, token))) {
+
+#if defined(USE_MWAIT)
+		monitor_mwait(ecx, &imsg->monitor, cstate_wait);
+#endif//usemwait
+#if defined(POLL)
+			cpu_relax();
+			//asm volatile("pause" ::: "memory");
+#endif
+	}
+	return 0;
+}
 
 
 static int ipc_thread_func(void *input)
-{ 
-	/* This will be a while true loop with timing code and mwaits 
-	   CPU 1 WILL be the first to send info. It will ROT 13 some
-	   message and inc on some pointer at 128 bytes.
+{
 
-	   CPU 0 will come in here and will monitor/mwait on the 128
-	   byte boundary until it gets out of its OPT loop
-	*/
-	
-	struct file *filep = input;
+ 	struct file *filep = input;
 	struct ipc_container *container = NULL;
-	unsigned long ecx = 1; /*break of interrupt flag */
-	unsigned long cstate_wait = 2;
-	//	struct timespec64 start;
-	//struct timespec64 end;
-	size_t offset = 0;
-	void* buf;
-	struct ipc_message *overlay;
-	struct ipc_message *overlay2;
-	int count = 0;
-	int retry_count = 0;
 
-	if(filep == NULL) {
+	struct ttd_ring_channel *prod_channel;
+	struct ttd_ring_channel *cons_channel;
+	unsigned long flags;
+	int count = 0;
+	unsigned int local_prod, local_cons;
+	struct ipc_message *prod_msg, *cons_msg;
+	unsigned int pTok = 0xC1346BAD;
+	unsigned int cTok = 0xBADBEEF;
+
+
+	if (filep == NULL) {
 		pr_debug("Thread was sent a null filepointer!\n");
 		return -EINVAL;
 	}
 
 	container = filep->private_data;
 
-	if(container == NULL && container->mem_size == 0){
+	if (container == NULL && container->channel_tx == NULL) {
 		pr_debug("container was null in thread!\n");
 		return -EINVAL;
 	}
-	buf = container->mem_start;
 
-	pr_debug("Hello from thread in CPU %d\n", CPU_NUM);
+	prod_channel = container->channel_tx;
+	cons_channel = container->channel_rx;
 
-	if(CPU_NUM == 3) {
-		while(count < 150) {
-			/*we recv first */
-			overlay = get_current_slot(offset, buf);
-			/* TIME ON */
-			//pr_debug("BETA %d WAITING ON MONITOR, at %p\n", CPU_NUM, &overlay->monitor);
-		retry:
-		       	
-			monitor_mwait(ecx,&overlay->monitor, cstate_wait);
-			/*TIME OFF!*/
-		    
-			if(keep_waiting(overlay,0xdeadbeef) && retry_count < 150) {
-				retry_count++;
-				pr_debug("Retrying with count %d on CPU %d\n", 
-					 retry_count, CPU_NUM);
-				goto retry;
-			}
-			else if(retry_count > 150){
-				printk(KERN_DEBUG "TERMINATING EARLY ON CPU %d\n", CPU_NUM);
-				break;
-			}
-						
-			retry_count = 0;
-			
-			/* TIME OFF */			
-			assert_expect_and_zero(overlay,0);
-			rot13(overlay->message, 123);
-			overlay2 = get_next_slot(&offset,buf);
-			send_and_notify(overlay2,overlay->message,124,0xbadc0de);
-			get_next_slot(&offset,buf);
-			count++;
-		}
+	/* PRODUCER */
+	local_prod = 1;
+	local_cons = 1;
+	ttd_ring_channel_set_prod(prod_channel, 1);
+	ttd_ring_channel_set_cons(prod_channel, 0);
+	/* 10 mil */
+
+	prod_msg = get_next_available_slot(prod_channel, local_prod);
+	cons_msg = get_next_available_slot(cons_channel, local_cons);
+
+	local_irq_save(flags);
+	preempt_disable();
+
+
+#if !defined(USE_FLOOD)
+	while (count < NUM_LOOPS) {
+#endif
+#if defined(USE_FLOOD)
+	while (count < NUM_LOOPS * FLOOD_SIZE) {
+#endif
+		/* wait and get message */
+		wait_for_consumer_slot(cons_msg, cTok);
+		//if (wait_for_consumer_slot(cons_channel, local_cons, &imsg, cTok))
+		//	break;
+
+		/* NOTIFY RECEVD */
+		cons_msg->monitor = pTok;
+		//pr_debug("Notified recvd on CPU %d at volatile location %p\n",
+		//	 CPU_NUM, &cons_msg->monitor);
+
+		//if(cons_msg->message[3] != '1')
+		//	pr_err("message on slave wasnt whjat we expected \n");
+
+
+		/* wait and get writer slot*/
+		wait_for_producer_slot(prod_msg, pTok);
+		//prod_msg->message[0] = 'b';
+		//prod_msg->message[1] = 'e';
+		//prod_msg->message[2] = 't';
+		//prod_msg->message[3] = '2';
+		prod_msg->monitor = cTok;
+		local_prod++;
+		local_cons++;
+		prod_msg = get_next_available_slot(prod_channel, local_prod);
+		cons_msg = get_next_available_slot(cons_channel, local_cons);
+		count++;
+
 	}
-	return 0;
+	preempt_enable();
+	local_irq_restore(flags);
 
+	return 1;
 }
+
 
 static inline unsigned long beta_ret_cpu(unsigned long __arg)
 {
 
-	unsigned long __user *arg = (void*) __arg;
+	unsigned long __user *arg = (void *) __arg;
+
 	return put_user(CPU_NUM, arg);
 }
 
 
 static unsigned long beta_unpark_thread(struct ipc_container *container)
 {
-
-
-	if(container->thread == NULL || container->mem_size == 0) {
+	if (container->thread == NULL)
 		return -EINVAL;
-	}
 
 	/* FROM THIS POINT FORWARD, ATLEAST ONE OF THE THREADS
 	 * IS SITTING IN THE COMM CODE
 	 */
+
 	pr_debug("waking up process on CPU %d\n", CPU_NUM);
-	//kthread_stop(container->thread);
-	kthread_unpark(container->thread);
-	if(wake_up_process(container->thread) == 1){
-			pr_debug("Woke up process on cpu %d\n", CPU_NUM);
-	}
-    	return 0;
+	//	kthread_unpark(container->thread);
+	if (wake_up_process(container->thread) == 1)
+		pr_debug("Woke up process on cpu %d\n", CPU_NUM);
+
+	return 0;
 }
 
 
@@ -242,78 +305,115 @@ static unsigned long beta_connect_mem(struct ipc_container *container,
 				      unsigned long __arg)
 {
 
-	unsigned long  __user *ubuf = (void*) __arg;
-	unsigned long kland_real; 
+	unsigned long  __user *ubuf = (void *) __arg;
+	unsigned long kland_real;
 	unsigned long *kland;
-	
-	if(get_user(kland_real,ubuf)) {
-		pr_debug("get_user failed connect_mem at addr %lux\n", ubuf);
-		return -EFAULT;
-	
-	}
-	
-	kland = (unsigned long*) kland_real;
-	
-	if(kland != NULL && *kland != 0xdeadbeef) {
+
+	if (get_user(kland_real, ubuf)) {
+		pr_debug("get_user failed connect_mem with ptr %p\n", ubuf);
 		return -EFAULT;
 	}
-	*kland = 0;
-	container->mem_start = kland;
-	container->mem_size = PAGE_SIZE * 2;
+
+	kland = (unsigned long *) kland_real;
+
+	if (kland == NULL)
+		return -EFAULT;
+
+
+	/* todo talk about this bootstrap issue while we're beta testing */
+	/* perhaps, we can use extern and export syms? */
+	container->channel_rx = (struct ttd_ring_channel *) kland;
 	return 0;
 }
 
 static unsigned long beta_alloc_mem(struct ipc_container *container)
 {
-	if(container->mem_size > 0) {
-		return 0;
+	int ret;
+	int i;
+	if (container->channel_tx == NULL)
+		return -EINVAL;
+
+	ret = ttd_ring_channel_alloc(container->channel_tx,
+				     CHAN_NUM_PAGES,
+				     sizeof(struct ipc_message));
+
+	if (ret != 0) {
+		pr_err("Failed to alloc/Init ring channel\n");
+		return -ENOMEM;
 	}
-	container->mem_start = kzalloc((PAGE_SIZE * 2), GFP_KERNEL);
-	if(!container->mem_start) {
-		return -1;
-	}
+	pr_debug("Channel is at %p, recs are %p to %p\n", (void*)container->channel_tx,
+		 container->channel_tx->recs,
+		 container->channel_tx->recs + (CHAN_NUM_PAGES * PAGE_SIZE));
+	start = (unsigned long) container->channel_tx->recs;
+	end = (unsigned long) container->channel_tx->recs + (CHAN_NUM_PAGES * PAGE_SIZE);
+
 	
-	container->mem_size = PAGE_SIZE * 2;
-	
-	/* Yes I know this is outright disgusting */
-	*((unsigned long*)container->mem_start) = 0xdeadbeef;
-	
+	for(i = 0; i < (CHAN_NUM_PAGES * PAGE_SIZE)/sizeof(int); i++)
+		*((int *)container->channel_tx->recs+i) = 0xC1346BAD;
+	//memseta(container->channel_tx->recs, 0, (CHAN_NUM_PAGES * PAGE_SIZE));
 	return 0;
 }
 
 static int beta_open(struct inode *nodp, struct file *filep)
 {
-	
-	/* setup kernel thread, bound to some CPU, but do not run */
+
 	struct ipc_container *container;
-	
+	struct cpumask cpu_core;
+
+	should_stop = 0;
 	container = kzalloc(sizeof(*container), GFP_KERNEL);
-	
-	if(!container) {
-		pr_debug("Could not alloc space for container\n");
-		return -1;
+
+	if (!container) {
+		pr_err("Could not alloc space for container\n");
+		return -ENOMEM;
 	}
-	
-	container->thread = kthread_create_on_cpu(&ipc_thread_func, (void*)filep,CPU_NUM,"betaIPC.%u");
-	
-	if(IS_ERR(container->thread)) {
-		pr_debug("Error while creating kernel thread\n");
+
+	container->channel_tx = kzalloc(sizeof(*container->channel_tx),
+					GFP_KERNEL);
+
+	if (!container->channel_tx) {
+		pr_err("Could not alloc space for ring channel\n");
+		return -ENOMEM;
+	}
+
+	container->thread = kthread_create(&ipc_thread_func, (void *)filep,
+					   "betaIPC.%u",CPU_NUM);
+	/*container->thread = kthread_create_on_cpu(&ipc_thread_func,
+	  (void *)filep, CPU_NUM, "betaIPC.%u");*/
+
+	if (IS_ERR(container->thread)) {
+		pr_err("Error while creating kernel thread\n");
 		return PTR_ERR(container->thread);
 	}
-	
-	filep->private_data = container;
-	
-	return 0;
 
+
+	get_task_struct(container->thread);
+
+
+	cpumask_clear(&cpu_core);
+	cpumask_set_cpu(CPU_NUM,&cpu_core);
+
+	set_cpus_allowed_ptr(container->thread, &cpu_core);
+
+
+	filep->private_data = container;
+	return 0;
 }
 
 static int beta_close(struct inode *nodp, struct file *filep)
 {
-	/* TODO STOP LEAKING 2 PAGES OF MEMORY FROM THE CONTAINER!\n */
+
 	struct ipc_container *container;
-	container = filep->private_data;
-	//	kthread_stop(container->thread);
+	should_stop = 1;
+       	container = filep->private_data;
+
+	put_task_struct(container->thread);
+
+	if (container->channel_tx)
+		ttd_ring_channel_free(container->channel_tx);
+
 	kfree(container);
+
 	return 0;
 }
 
@@ -321,17 +421,25 @@ static long beta_return_mem(struct ipc_container *container,
 			    unsigned long __arg)
 {
 	unsigned long __user  *save = (unsigned long *) __arg;
-	return put_user((unsigned long)container->mem_start, save);
+
+	return put_user((unsigned long)container->channel_tx, save);
 }
 
-static long beta_ioctl(struct file *filep, unsigned int cmd,
-			  unsigned long __arg)
+
+
+static void dump_time(void)
 {
-	
+
+}
+
+
+static long beta_ioctl(struct file *filep, unsigned int cmd,
+		       unsigned long __arg)
+{
 	struct ipc_container *container = filep->private_data;
 	long ret = 0;
-	
-	switch(cmd){
+
+	switch (cmd) {
 	case BETA_ALLOC_MEM:
 		ret = beta_alloc_mem(container);
 		break;
@@ -347,15 +455,15 @@ static long beta_ioctl(struct file *filep, unsigned int cmd,
 	case BETA_GET_MEM:
 		ret = beta_return_mem(container, __arg);
 		break;
+	case BETA_DUMP_TIME:
+		dump_time();
+		break;
 	default:
 		pr_debug("No such ioctl %d\n", cmd);
 		break;
-		
 	}
-	return 0;
+	return ret;
 }
-
-
 
 static const struct file_operations betaIPC_fops = {
 	.owner	 = THIS_MODULE,
@@ -375,21 +483,27 @@ static struct miscdevice dev = {
 static int __init bIPC_init(void)
 {
 	int ret = 0;
-	
+
+	CPU_NUM = 3;
+	if (this_cpu_has(X86_FEATURE_MWAIT))
+		printk(KERN_DEBUG "HAS MWAIT\n");
+
 	/* reading through the source of misc.c it looks like register
 	   will init everything else for us */
+	pr_debug("hello from bIPC with pr_debug\n");
+	printk(KERN_DEBUG "Hello from bIPC with printk\n");
 	ret = misc_register(&dev);
-	if(ret) {
+	if (ret) {
 		pr_debug("Failed to register dev for BetaIPC\n");
 		return ret;
 	}
 
 	return ret;
 }
-
 static int __exit bIPC_rmmod(void)
 {
 	int ret = 0;
+
 	ret = misc_deregister(&dev);
 	if (ret) {
 		pr_debug("Failed to de-reg dev in eudy!\n");
@@ -401,4 +515,3 @@ static int __exit bIPC_rmmod(void)
 
 module_init(bIPC_init);
 module_exit(bIPC_rmmod);
-
